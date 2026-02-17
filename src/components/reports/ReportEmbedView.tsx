@@ -4,12 +4,14 @@
  * Client-only Power BI embed view with bi-directional filter sync.
  *
  * Power BI → ArcGIS:
- *   Listens to `dataSelected` events. Extracts selected data-point values,
- *   maps them via FIELD_MAPPINGS, and pushes FilterEntries to the shared context.
+ *   1. `dataSelected` event — captures clicks on chart data points.
+ *      Extracts values from both `identity` (dimension keys) and
+ *      `values` (measure/column values) arrays.
+ *   2. `rendered` event — after any re-render (including slicer changes),
+ *      polls active page filters/slicers and pushes matching ones to context.
  *
  * ArcGIS → Power BI:
- *   Watches context.activeFilters for entries with source="arcgis".
- *   Converts them to Power BI BasicFilters and calls report.setFilters().
+ *   Watches activeFilters with source="arcgis" and calls report.setFilters().
  */
 
 import { useCallback, useEffect, useRef } from "react";
@@ -35,17 +37,57 @@ export function ReportEmbedView({
 }: ReportEmbedViewProps) {
   const reportRef = useRef<Report | null>(null);
   const { activeFilters, setFilters } = useMapReportFilters();
+  const renderedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // ── Power BI → ArcGIS: capture data selections ──────────────────────
+  // ── Helper: push a table/column/value triplet into the filter list ──
+  const pushFilter = useCallback(
+    (
+      filters: FilterEntry[],
+      table: string,
+      column: string,
+      value: string | number,
+    ) => {
+      const mapping = FIELD_MAPPINGS.find(
+        (m) => m.powerbiTable === table && m.powerbiColumn === column,
+      );
+      const field = mapping?.arcgisField ?? column;
+
+      const existing = filters.find((f) => f.field === field);
+      if (existing) {
+        if (!existing.values.includes(value)) {
+          existing.values.push(value);
+        }
+      } else {
+        filters.push({
+          field,
+          powerbiTable: table,
+          powerbiColumn: column,
+          values: [value],
+          source: "powerbi",
+        });
+      }
+    },
+    [],
+  );
+
+  // ── Power BI → ArcGIS: capture data selections (chart clicks) ───────
   const handleDataSelected = useCallback(
     (event?: service.ICustomEvent<unknown>) => {
       if (!event?.detail) return;
+
+      // Log the raw payload so we can debug field names
+      console.log("[PowerBI] dataSelected payload:", JSON.stringify(event.detail, null, 2));
 
       const detail = event.detail as {
         dataPoints?: Array<{
           identity?: Array<{
             target?: { table?: string; column?: string };
             equals?: string | number;
+          }>;
+          values?: Array<{
+            target?: { table?: string; column?: string };
+            value?: string | number;
+            formattedValue?: string;
           }>;
         }>;
       };
@@ -59,57 +101,101 @@ export function ReportEmbedView({
       const newFilters: FilterEntry[] = [];
 
       for (const dp of dataPoints) {
+        // Extract from identity (dimension keys — typically table/column/value)
         for (const id of dp.identity ?? []) {
           const table = id.target?.table;
           const column = id.target?.column;
           const value = id.equals;
-          if (!table || !column || value === undefined) continue;
+          if (table && column && value !== undefined) {
+            pushFilter(newFilters, table, column, value);
+          }
+        }
 
-          const mapping = FIELD_MAPPINGS.find(
-            (m) => m.powerbiTable === table && m.powerbiColumn === column,
-          );
-
-          if (mapping) {
-            const existing = newFilters.find(
-              (f) => f.field === mapping.arcgisField,
-            );
-            if (existing) {
-              if (!existing.values.includes(value)) {
-                existing.values.push(value);
-              }
-            } else {
-              newFilters.push({
-                field: mapping.arcgisField,
-                powerbiTable: table,
-                powerbiColumn: column,
-                values: [value],
-                source: "powerbi",
-              });
-            }
-          } else {
-            // No explicit mapping — pass through using column name as field
-            const existing = newFilters.find((f) => f.field === column);
-            if (existing) {
-              if (!existing.values.includes(value)) {
-                existing.values.push(value);
-              }
-            } else {
-              newFilters.push({
-                field: column,
-                powerbiTable: table,
-                powerbiColumn: column,
-                values: [value],
-                source: "powerbi",
-              });
-            }
+        // Extract from values (measure/category values)
+        for (const v of dp.values ?? []) {
+          const table = v.target?.table;
+          const column = v.target?.column;
+          const value = v.value ?? v.formattedValue;
+          if (table && column && value !== undefined) {
+            pushFilter(newFilters, table, column, value);
           }
         }
       }
 
-      setFilters(newFilters);
+      if (newFilters.length > 0) {
+        console.log("[PowerBI] Pushing filters to ArcGIS:", newFilters);
+        setFilters(newFilters);
+      }
     },
-    [setFilters],
+    [setFilters, pushFilter],
   );
+
+  // ── Power BI → ArcGIS: poll active filters after report re-renders ──
+  const pollActiveFilters = useCallback(async () => {
+    const report = reportRef.current;
+    if (!report) return;
+
+    try {
+      const pages = await report.getPages();
+      const activePage = pages.find((p) => p.isActive);
+      if (!activePage) return;
+
+      // Get page-level filters (applied by slicers, filter pane, etc.)
+      const pageFilters = await activePage.getFilters();
+      if (!pageFilters || pageFilters.length === 0) return;
+
+      const newFilters: FilterEntry[] = [];
+
+      for (const f of pageFilters) {
+        // Only handle BasicFilter with "In" operator (slicer selections)
+        if (f.filterType !== models.FilterType.Basic) continue;
+
+        const basicFilter = f as models.IBasicFilter;
+        const target = basicFilter.target as
+          | { table?: string; column?: string }
+          | undefined;
+        const table = target?.table;
+        const column = target?.column;
+        const values = basicFilter.values;
+
+        if (!table || !column || !values || values.length === 0) continue;
+
+        for (const val of values) {
+          if (val !== undefined && val !== null) {
+            pushFilter(
+              newFilters,
+              table,
+              column,
+              val as string | number,
+            );
+          }
+        }
+      }
+
+      if (newFilters.length > 0) {
+        console.log("[PowerBI] Slicer/filter-pane filters →", newFilters);
+        setFilters(newFilters);
+      }
+    } catch (err) {
+      // Silently ignore — report may not be fully loaded yet
+      console.debug("[PowerBI] Could not poll filters:", err);
+    }
+  }, [setFilters, pushFilter]);
+
+  const handleRendered = useCallback(() => {
+    // Debounce: rendered fires many times; wait 500ms after last one
+    if (renderedTimerRef.current) clearTimeout(renderedTimerRef.current);
+    renderedTimerRef.current = setTimeout(() => {
+      pollActiveFilters();
+    }, 500);
+  }, [pollActiveFilters]);
+
+  // Cleanup timer on unmount
+  useEffect(() => {
+    return () => {
+      if (renderedTimerRef.current) clearTimeout(renderedTimerRef.current);
+    };
+  }, []);
 
   // ── ArcGIS → Power BI: apply incoming filters to the report ─────────
   useEffect(() => {
@@ -160,6 +246,7 @@ export function ReportEmbedView({
 
   const eventHandlers = new Map<string, EventHandler>([
     ["dataSelected", handleDataSelected],
+    ["rendered", handleRendered],
     [
       "loaded",
       () => {

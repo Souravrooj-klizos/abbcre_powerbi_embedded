@@ -3,19 +3,15 @@
 /**
  * ArcGIS Map Component with bi-directional filter sync to Power BI.
  *
- * Auth modes (unchanged):
- *   Preferred: API Key → no sign-in for viewers.
- *   Fallback:  OAuth 2.0 → each viewer signs in.
+ * Auth: API Key (preferred, no sign-in) or OAuth 2.0 (fallback).
  *
- * Filter sync:
- *   Power BI → ArcGIS:
- *     Reads activeFilters from MapReportFilterContext (source="powerbi").
- *     Applies `definitionExpression` on matching FeatureLayers.
+ * Filter sync (Power BI → ArcGIS):
+ *   Uses client-side FeatureFilter (via FeatureLayerView.filter) instead of
+ *   server-side definitionExpression. This avoids "Failed to load tile" errors
+ *   because we filter already-loaded features in the browser.
  *
- *   ArcGIS → Power BI:
- *     On map click (hit test), reads feature attributes, maps them via
- *     FIELD_MAPPINGS, and pushes FilterEntries to context (source="arcgis").
- *     Power BI ReportEmbedView picks them up and calls report.setFilters().
+ * Filter sync (ArcGIS → Power BI):
+ *   On map click, reads feature attributes and pushes to shared context.
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
@@ -29,6 +25,9 @@ import WebMap from "@arcgis/core/WebMap";
 import MapView from "@arcgis/core/views/MapView";
 import Portal from "@arcgis/core/portal/Portal";
 import FeatureLayer from "@arcgis/core/layers/FeatureLayer";
+import FeatureFilter from "@arcgis/core/layers/support/FeatureFilter";
+import type Layer from "@arcgis/core/layers/Layer";
+import type GroupLayer from "@arcgis/core/layers/GroupLayer";
 
 import {
     useMapReportFilters,
@@ -43,6 +42,25 @@ type ArcGISMapProps = {
     className?: string;
     height?: string;
 };
+
+/**
+ * Recursively collect all FeatureLayers from a WebMap,
+ * including those nested inside GroupLayers.
+ */
+function collectFeatureLayers(layers: __esri.Collection<Layer>): FeatureLayer[] {
+    const result: FeatureLayer[] = [];
+    for (const layer of layers) {
+        if (layer.type === "feature") {
+            result.push(layer as FeatureLayer);
+        } else if (layer.type === "group") {
+            const group = layer as unknown as GroupLayer;
+            if (group.layers) {
+                result.push(...collectFeatureLayers(group.layers));
+            }
+        }
+    }
+    return result;
+}
 
 export function ArcGISMap({
     webMapId,
@@ -73,13 +91,12 @@ export function ArcGISMap({
     const resolvedWebMapId =
         webMapId || process.env.NEXT_PUBLIC_ARCGIS_WEBMAP_ID || "";
 
-    // ── Helper: build SQL where clause from filter entries ─────────────
+    // ── Helper: build SQL where clause string for a FeatureFilter ──────
     const buildWhereClause = useCallback(
         (layer: FeatureLayer, filters: FilterEntry[]): string | null => {
             const clauses: string[] = [];
 
             for (const filter of filters) {
-                // Find mapping for this filter → layer pair
                 const mapping = FIELD_MAPPINGS.find((m) => {
                     const fieldMatch = m.arcgisField === filter.field;
                     const layerMatch =
@@ -88,6 +105,7 @@ export function ArcGISMap({
                     return fieldMatch && layerMatch;
                 });
 
+                // Use mapped field, or fall back to the filter's field name
                 const fieldName = mapping?.arcgisField ?? filter.field;
 
                 if (filter.values.length === 1) {
@@ -114,48 +132,64 @@ export function ArcGISMap({
         [],
     );
 
-    // ── Power BI → ArcGIS: apply incoming filters to map layers ───────
+    // ── Power BI → ArcGIS: apply filters using client-side FeatureFilter
     useEffect(() => {
+        const view = viewRef.current;
         const webmap = webmapRef.current;
-        if (!webmap || status !== "ready") return;
+        if (!view || !webmap || status !== "ready") return;
 
         const pbiFilters = activeFilters.filter((f) => f.source === "powerbi");
 
+        const featureLayers = collectFeatureLayers(webmap.layers);
+
         if (pbiFilters.length === 0) {
-            // Clear all definitionExpressions
-            for (const layer of webmap.layers) {
-                if (layer.type === "feature") {
-                    (layer as FeatureLayer).definitionExpression = "";
-                }
+            // Clear all client-side filters
+            for (const fl of featureLayers) {
+                view.whenLayerView(fl)
+                    .then((layerView) => {
+                        const flv = layerView as __esri.FeatureLayerView;
+                        flv.filter = null as unknown as FeatureFilter;
+                    })
+                    .catch(() => {});
             }
             setActiveFilterLabel(null);
             return;
         }
 
-        // Apply filters to matching FeatureLayers
-        for (const layer of webmap.layers) {
-            if (layer.type === "feature") {
-                const fl = layer as FeatureLayer;
-                const where = buildWhereClause(fl, pbiFilters);
-                fl.definitionExpression = where ?? "";
-            }
+        // Apply client-side filters to each FeatureLayer
+        for (const fl of featureLayers) {
+            const where = buildWhereClause(fl, pbiFilters);
+            view.whenLayerView(fl)
+                .then((layerView) => {
+                    const flv = layerView as __esri.FeatureLayerView;
+                    if (where) {
+                        flv.filter = new FeatureFilter({ where });
+                        console.log(
+                            `[ArcGIS] Client-side filter on "${fl.title}": ${where}`,
+                        );
+                    } else {
+                        flv.filter = null as unknown as FeatureFilter;
+                    }
+                })
+                .catch((err) => {
+                    console.warn(
+                        `[ArcGIS] Could not filter layer "${fl.title}":`,
+                        err,
+                    );
+                });
         }
 
-        // Build a human-readable label
         const label = pbiFilters
             .map((f) => `${f.field}: ${f.values.join(", ")}`)
             .join(" | ");
         setActiveFilterLabel(label);
 
-        console.log(
-            "[ArcGIS] Applied Power BI filters →",
-            pbiFilters,
-        );
+        console.log("[ArcGIS] Applied Power BI filters (client-side) →", pbiFilters);
     }, [activeFilters, status, buildWhereClause]);
 
     // ── ArcGIS → Power BI: map click handler ──────────────────────────
     const handleMapClick = useCallback(
-        async (view: MapView) => {
+        (view: MapView) => {
             view.on("click", async (event) => {
                 const response = await view.hitTest(event);
                 const results = response.results.filter(
@@ -179,7 +213,6 @@ export function ArcGISMap({
                 const newFilters: FilterEntry[] = [];
 
                 for (const mapping of FIELD_MAPPINGS) {
-                    // Only use mappings that match this layer (or have no layerTitle filter)
                     if (
                         mapping.arcgisLayerTitle &&
                         mapping.arcgisLayerTitle !== layerTitle
@@ -211,7 +244,7 @@ export function ArcGISMap({
         [setFilters, clearFilters],
     );
 
-    // ── Map initialisation (unchanged logic, with click handler added) ─
+    // ── Map initialisation ────────────────────────────────────────────
     useEffect(() => {
         if (!mapRef.current) return;
 
@@ -264,6 +297,18 @@ export function ArcGISMap({
                 view.destroy();
                 return;
             }
+
+            // Log all layers found for debugging field names
+            const allLayers = collectFeatureLayers(webmap.layers);
+            for (const fl of allLayers) {
+                await fl.load();
+                const fieldNames = fl.fields.map((f) => f.name);
+                console.log(
+                    `[ArcGIS] Layer "${fl.title}" fields:`,
+                    fieldNames,
+                );
+            }
+
             handleMapClick(view);
             setStatus("ready");
             console.log(
@@ -315,6 +360,17 @@ export function ArcGISMap({
                 view.destroy();
                 return;
             }
+
+            const allLayers = collectFeatureLayers(webmap.layers);
+            for (const fl of allLayers) {
+                await fl.load();
+                const fieldNames = fl.fields.map((f) => f.name);
+                console.log(
+                    `[ArcGIS] Layer "${fl.title}" fields:`,
+                    fieldNames,
+                );
+            }
+
             handleMapClick(view);
             setStatus("ready");
             console.log("[ArcGIS] Map loaded with OAuth");
