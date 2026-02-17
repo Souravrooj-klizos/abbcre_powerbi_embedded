@@ -1,0 +1,46 @@
+// Power BI Embedded Portal — User ↔ Report ↔ Role mapping (SOW Phase 2)
+// Database: Neon PostgreSQL (use pooled DATABASE_URL in .env.local)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  reportRoles UserReportRole[]
+}
+
+model PowerBIReport {
+  id          String   @id @default(cuid())
+  reportId    String   // Power BI report GUID (from Power BI Service)
+  workspaceId String   // Power BI workspace (group) ID
+  name        String?  // Display name
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  reportRoles UserReportRole[]
+
+  @@unique([workspaceId, reportId])
+}
+
+// Maps which user can see which report with which RLS role(s)
+model UserReportRole {
+  id               String   @id @default(cuid())
+  userId           String
+  powerbiReportId  String   // FK to PowerBIReport.id (our DB record)
+  roleName         String   // RLS role name (e.g. "Region_EMEA")
+  createdAt        DateTime @default(now())
+
+  user   User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  report PowerBIReport @relation(fields: [powerbiReportId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, powerbiReportId, roleName])
+}

@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ArcGIS OAuth Callback</title>
+</head>
+<body>
+  <!--
+    This page handles the OAuth 2.0 redirect from ArcGIS.
+    After the user signs in, ArcGIS redirects back here with a token.
+    The ArcGIS IdentityManager reads the token from the URL and closes the popup.
+  -->
+  <script src="https://js.arcgis.com/4.29/"></script>
+  <script>
+    require(["esri/identity/IdentityManager"], function (IdentityManager) {
+      IdentityManager.setOAuthResponseHash(window.location.hash);
+      // Close the popup after processing
+      window.close();
+    });
+  </script>
+</body>
+</html>
