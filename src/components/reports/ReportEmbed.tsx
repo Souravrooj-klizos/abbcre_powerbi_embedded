@@ -3,7 +3,7 @@
 /**
  * SOW Phase 3: Embed Component — App owns data.
  * Uses powerbi-client-react via dynamic import (ssr: false) to avoid "self is not defined" in Next.js SSR.
- */
+ */ 
 
 import dynamic from "next/dynamic";
 import { useEffect, useState } from "react";
