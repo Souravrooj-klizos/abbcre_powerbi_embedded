@@ -27,6 +27,7 @@ import Portal from "@arcgis/core/portal/Portal";
 import FeatureLayer from "@arcgis/core/layers/FeatureLayer";
 import FeatureFilter from "@arcgis/core/layers/support/FeatureFilter";
 import Color from "@arcgis/core/Color";
+import * as reactiveUtils from "@arcgis/core/core/reactiveUtils";
 import type Layer from "@arcgis/core/layers/Layer";
 import type GroupLayer from "@arcgis/core/layers/GroupLayer";
 
@@ -280,18 +281,18 @@ export function ArcGISMap({
     // ── Setup popups, hover tooltips + highlight, click → filter sync ──
     const setupInteractions = useCallback(
         (view: MapView) => {
-            const popup = view.popup;
-            const container = view.container;
-            if (!popup || !container) return;
-
             // 1. Enable popups (WebMap already defines popupInfo per layer)
             view.popupEnabled = true;
-            popup.dockEnabled = true;
-            popup.dockOptions = {
-                buttonEnabled: true,
-                breakpoint: false,
-                position: "top-right",
-            };
+
+            // Configure popup docking once popup is available
+            if (view.popup) {
+                view.popup.dockEnabled = true;
+                view.popup.dockOptions = {
+                    buttonEnabled: true,
+                    breakpoint: false,
+                    position: "top-right",
+                };
+            }
 
             // Track whether the popup was opened by a click (so hover doesn't close it)
             let popupOpenedByClick = false;
@@ -318,7 +319,9 @@ export function ArcGISMap({
                         const layer = graphic.layer;
 
                         // Change cursor to pointer
-                        container.style.cursor = "pointer";
+                        if (view.container) {
+                            view.container.style.cursor = "pointer";
+                        }
 
                         // Highlight the hovered feature
                         if (layer && layer.type === "feature") {
@@ -332,30 +335,36 @@ export function ArcGISMap({
                         }
 
                         // Show hover popup only if no click-popup is active
-                        if (!popupOpenedByClick) {
-                            popup.open({
+                        if (!popupOpenedByClick && view.popup) {
+                            view.popup.open({
                                 features: [graphic],
                                 location: view.toMap(event),
                             });
                         }
                     } else {
                         // Reset cursor
-                        container.style.cursor = "default";
+                        if (view.container) {
+                            view.container.style.cursor = "default";
+                        }
 
                         // Close hover popup only if it wasn't opened by a click
-                        if (!popupOpenedByClick && popup.visible) {
-                            popup.close();
+                        if (!popupOpenedByClick && view.popup?.visible) {
+                            view.popup.close();
                         }
                     }
                 }, 100);
             });
 
             // Reset popupOpenedByClick when popup is closed by user
-            popup.watch("visible", (visible: boolean) => {
-                if (!visible) {
-                    popupOpenedByClick = false;
-                }
-            });
+            // Use reactiveUtils.watch (modern API) instead of popup.watch
+            reactiveUtils.watch(
+                () => view.popup?.visible,
+                (visible) => {
+                    if (!visible) {
+                        popupOpenedByClick = false;
+                    }
+                },
+            );
 
             // 3. Click: show popup (sticky) + push filters to Power BI
             view.on("click", async (event) => {
@@ -366,17 +375,19 @@ export function ArcGISMap({
 
                 if (results.length === 0) {
                     popupOpenedByClick = false;
-                    popup.close();
+                    view.popup?.close();
                     clearFilters();
                     return;
                 }
 
                 // Open popup with all hit features (user can browse with arrows)
                 popupOpenedByClick = true;
-                popup.open({
-                    features: results.map((r) => r.graphic),
-                    location: view.toMap(event),
-                });
+                if (view.popup) {
+                    view.popup.open({
+                        features: results.map((r) => r.graphic),
+                        location: view.toMap(event),
+                    });
+                }
 
                 // Build filter entries from the first hit graphic
                 const graphic = results[0].graphic;
