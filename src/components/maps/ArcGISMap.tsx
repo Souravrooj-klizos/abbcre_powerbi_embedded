@@ -91,32 +91,45 @@ export function ArcGISMap({
     const resolvedWebMapId =
         webMapId || process.env.NEXT_PUBLIC_ARCGIS_WEBMAP_ID || "";
 
-    // ── Helper: build SQL where clause string for a FeatureFilter ──────
+    // ── Helper: build SQL where clause for a specific layer ──────────
+    // Only includes filter entries that have a matching FIELD_MAPPING
+    // for this layer. Applies transformValue if present.
     const buildWhereClause = useCallback(
         (layer: FeatureLayer, filters: FilterEntry[]): string | null => {
             const clauses: string[] = [];
 
             for (const filter of filters) {
+                // Find all mappings that match this filter's Power BI column AND this layer
                 const mapping = FIELD_MAPPINGS.find((m) => {
-                    const fieldMatch = m.arcgisField === filter.field;
+                    const columnMatch =
+                        m.powerbiTable === filter.powerbiTable &&
+                        m.powerbiColumn === filter.powerbiColumn;
                     const layerMatch =
                         !m.arcgisLayerTitle ||
                         m.arcgisLayerTitle === layer.title;
-                    return fieldMatch && layerMatch;
+                    return columnMatch && layerMatch;
                 });
 
-                // Use mapped field, or fall back to the filter's field name
-                const fieldName = mapping?.arcgisField ?? filter.field;
+                // No mapping for this layer → skip (don't apply unknown fields)
+                if (!mapping) continue;
 
-                if (filter.values.length === 1) {
-                    const v = filter.values[0];
+                const fieldName = mapping.arcgisField;
+                const transform = mapping.transformValue;
+
+                // Transform values (e.g. strip emoji prefix)
+                const cleanValues = filter.values.map((v) =>
+                    transform ? transform(v) : v,
+                );
+
+                if (cleanValues.length === 1) {
+                    const v = cleanValues[0];
                     clauses.push(
                         typeof v === "number"
                             ? `${fieldName} = ${v}`
                             : `${fieldName} = '${v.toString().replace(/'/g, "''")}'`,
                     );
-                } else if (filter.values.length > 1) {
-                    const vals = filter.values
+                } else if (cleanValues.length > 1) {
+                    const vals = cleanValues
                         .map((v) =>
                             typeof v === "number"
                                 ? v
@@ -179,8 +192,21 @@ export function ArcGISMap({
                 });
         }
 
+        // Build a clean label using the first mapping's transform (to strip emoji)
         const label = pbiFilters
-            .map((f) => `${f.field}: ${f.values.join(", ")}`)
+            .map((f) => {
+                const mapping = FIELD_MAPPINGS.find(
+                    (m) =>
+                        m.powerbiTable === f.powerbiTable &&
+                        m.powerbiColumn === f.powerbiColumn,
+                );
+                const transform = mapping?.transformValue;
+                const cleanVals = f.values
+                    .map((v) => (transform ? transform(v) : v))
+                    .join(", ");
+                const displayField = mapping?.arcgisField ?? f.field;
+                return `${displayField}: ${cleanVals}`;
+            })
             .join(" | ");
         setActiveFilterLabel(label);
 
