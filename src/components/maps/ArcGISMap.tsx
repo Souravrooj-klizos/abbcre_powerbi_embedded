@@ -27,7 +27,6 @@ import Portal from "@arcgis/core/portal/Portal";
 import FeatureLayer from "@arcgis/core/layers/FeatureLayer";
 import FeatureFilter from "@arcgis/core/layers/support/FeatureFilter";
 import Color from "@arcgis/core/Color";
-import * as reactiveUtils from "@arcgis/core/core/reactiveUtils";
 import type Layer from "@arcgis/core/layers/Layer";
 import type GroupLayer from "@arcgis/core/layers/GroupLayer";
 
@@ -43,6 +42,45 @@ type ArcGISMapProps = {
     apiKey?: string;
     className?: string;
     height?: string;
+};
+
+/**
+ * Per-layer configuration for which fields to display in the hover tooltip.
+ * Key = layer title (from WebMap). Value = array of { field, label } pairs.
+ * If a layer is not listed here, the tooltip will show the first 6 non-OID fields.
+ */
+const TOOLTIP_FIELDS: Record<string, { field: string; label: string }[]> = {
+    "NC_Permits_Cleaned": [
+        { field: "Permit_Number", label: "Permit #" },
+        { field: "Category", label: "Category" },
+        { field: "Type", label: "Type" },
+        { field: "Status", label: "Status" },
+        { field: "County", label: "County" },
+        { field: "Full_Address", label: "Address" },
+        { field: "Unit_Count", label: "Units" },
+    ],
+    "NC_Dentists_All merged": [
+        { field: "Dentist_Org_Name", label: "Name" },
+        { field: "Speciality", label: "Speciality" },
+        { field: "Type", label: "Type" },
+        { field: "Phone", label: "Phone" },
+        { field: "Address", label: "Address" },
+        { field: "Lebel", label: "County" },
+        { field: "Website", label: "Website" },
+    ],
+    "New overlay county": [
+        { field: "County", label: "County" },
+        { field: "Historic_Growth_Category", label: "Growth Category" },
+        { field: "Historic_5_Year_Growth___", label: "5-Year Growth (%)" },
+        { field: "Projected_Growth_Category", label: "Projected Growth" },
+        { field: "Projected_5_year_growth__census_driven____", label: "Proj. 5yr (%)" },
+        { field: "Rec_Survey", label: "Survey Available" },
+    ],
+    "North Carolina State and County Boundary Polygons": [
+        { field: "CountyName", label: "County" },
+        { field: "County", label: "County" },
+        { field: "FIPS", label: "FIPS Code" },
+    ],
 };
 
 /**
@@ -77,6 +115,7 @@ export function ArcGISMap({
     const initialExtentRef = useRef<__esri.Extent | null>(null);
     const highlightHandlesRef = useRef<__esri.Handle[]>([]);
     const hoverHighlightRef = useRef<__esri.Handle | null>(null);
+    const tooltipRef = useRef<HTMLDivElement>(null);
     const [status, setStatus] = useState<
         "loading" | "authenticating" | "ready" | "error"
     >("loading");
@@ -86,6 +125,12 @@ export function ArcGISMap({
     const [activeFilterLabel, setActiveFilterLabel] = useState<string | null>(
         null,
     );
+    const [hoverInfo, setHoverInfo] = useState<{
+        x: number;
+        y: number;
+        layerTitle: string;
+        fields: { label: string; value: string }[];
+    } | null>(null);
 
     const { activeFilters, setFilters, clearFilters } = useMapReportFilters();
 
@@ -278,26 +323,47 @@ export function ArcGISMap({
         console.log("[ArcGIS] Applied Power BI filters (client-side) →", pbiFilters);
     }, [activeFilters, status, buildWhereClause]);
 
-    // ── Setup popups, hover tooltips + highlight, click → filter sync ──
-    const setupInteractions = useCallback(
-        (view: MapView) => {
-            // 1. Enable popups (WebMap already defines popupInfo per layer)
-            view.popupEnabled = true;
+    // ── Helper: build tooltip fields from a graphic ────────────────────
+    const buildTooltipFields = useCallback(
+        (
+            graphic: __esri.Graphic,
+            layerTitle: string,
+        ): { label: string; value: string }[] => {
+            const attrs = graphic.attributes;
+            if (!attrs) return [];
 
-            // Configure popup docking once popup is available
-            if (view.popup) {
-                view.popup.dockEnabled = true;
-                view.popup.dockOptions = {
-                    buttonEnabled: true,
-                    breakpoint: false,
-                    position: "top-right",
-                };
+            const config = TOOLTIP_FIELDS[layerTitle];
+            if (config) {
+                return config
+                    .filter((c) => attrs[c.field] !== undefined && attrs[c.field] !== null)
+                    .map((c) => ({
+                        label: c.label,
+                        value: String(attrs[c.field]),
+                    }));
             }
 
-            // Track whether the popup was opened by a click (so hover doesn't close it)
-            let popupOpenedByClick = false;
+            // Fallback: show first 6 non-OID fields
+            return Object.entries(attrs)
+                .filter(
+                    ([key, val]) =>
+                        !key.toLowerCase().includes("objectid") &&
+                        !key.toLowerCase().includes("oid") &&
+                        val !== null &&
+                        val !== undefined,
+                )
+                .slice(0, 6)
+                .map(([key, val]) => ({ label: key, value: String(val) }));
+        },
+        [],
+    );
 
-            // 2. Hover: show tooltip popup + highlight hovered feature
+    // ── Setup hover tooltip + highlight + click → filter sync ────────
+    const setupInteractions = useCallback(
+        (view: MapView) => {
+            // Disable native popup (we use our own custom tooltip)
+            view.popupEnabled = false;
+
+            // 1. Hover: highlight + show custom tooltip
             let hoverTimeout: ReturnType<typeof setTimeout> | null = null;
 
             view.on("pointer-move", (event) => {
@@ -334,62 +400,58 @@ export function ArcGISMap({
                             }
                         }
 
-                        // Show hover popup only if no click-popup is active
-                        if (!popupOpenedByClick && view.popup) {
-                            view.popup.open({
-                                features: [graphic],
-                                location: view.toMap(event),
+                        // Build tooltip data
+                        const layerTitle =
+                            layer && "title" in layer
+                                ? (layer as FeatureLayer).title ?? "Feature"
+                                : "Feature";
+                        const fields = buildTooltipFields(graphic, layerTitle);
+
+                        if (fields.length > 0) {
+                            setHoverInfo({
+                                x: event.x,
+                                y: event.y,
+                                layerTitle,
+                                fields,
                             });
+                        } else {
+                            setHoverInfo(null);
                         }
                     } else {
-                        // Reset cursor
+                        // Reset cursor + hide tooltip
                         if (view.container) {
                             view.container.style.cursor = "default";
                         }
-
-                        // Close hover popup only if it wasn't opened by a click
-                        if (!popupOpenedByClick && view.popup?.visible) {
-                            view.popup.close();
-                        }
+                        setHoverInfo(null);
                     }
-                }, 100);
+                }, 60);
             });
 
-            // Reset popupOpenedByClick when popup is closed by user
-            // Use reactiveUtils.watch (modern API) instead of popup.watch
-            reactiveUtils.watch(
-                () => view.popup?.visible,
-                (visible) => {
-                    if (!visible) {
-                        popupOpenedByClick = false;
-                    }
-                },
-            );
+            // Hide tooltip when pointer leaves the map
+            view.on("pointer-leave", () => {
+                setHoverInfo(null);
+                if (hoverHighlightRef.current) {
+                    hoverHighlightRef.current.remove();
+                    hoverHighlightRef.current = null;
+                }
+            });
 
-            // 3. Click: show popup (sticky) + push filters to Power BI
+            // 2. Click: push filters to Power BI
             view.on("click", async (event) => {
+                // Hide tooltip on click
+                setHoverInfo(null);
+
                 const response = await view.hitTest(event);
                 const results = response.results.filter(
                     (r): r is __esri.GraphicHit => r.type === "graphic",
                 );
 
                 if (results.length === 0) {
-                    popupOpenedByClick = false;
-                    view.popup?.close();
                     clearFilters();
                     return;
                 }
 
-                // Open popup with all hit features (user can browse with arrows)
-                popupOpenedByClick = true;
-                if (view.popup) {
-                    view.popup.open({
-                        features: results.map((r) => r.graphic),
-                        location: view.toMap(event),
-                    });
-                }
-
-                // Build filter entries from the first hit graphic
+                // Extract attributes from the first hit graphic for filter sync
                 const graphic = results[0].graphic;
                 const attrs = graphic.attributes;
                 if (!attrs) return;
@@ -430,7 +492,7 @@ export function ArcGISMap({
                 }
             });
         },
-        [setFilters, clearFilters],
+        [setFilters, clearFilters, buildTooltipFields],
     );
 
     // ── Map initialisation ────────────────────────────────────────────
@@ -727,15 +789,52 @@ export function ArcGISMap({
 
             {/* Map Container */}
             {status !== "error" && (
-                <div
-                    ref={mapRef}
-                    style={{ width: "100%", height }}
-                    className={`rounded-b-lg overflow-hidden border border-gray-200 ${
-                        status === "loading"
-                            ? "bg-gray-100 animate-pulse"
-                            : ""
-                    }`}
-                />
+                <div style={{ position: "relative", width: "100%", height }}>
+                    <div
+                        ref={mapRef}
+                        style={{ width: "100%", height: "100%" }}
+                        className={`rounded-b-lg overflow-hidden border border-gray-200 ${
+                            status === "loading"
+                                ? "bg-gray-100 animate-pulse"
+                                : ""
+                        }`}
+                    />
+
+                    {/* Custom hover tooltip */}
+                    {hoverInfo && (
+                        <div
+                            ref={tooltipRef}
+                            style={{
+                                position: "absolute",
+                                left: Math.min(hoverInfo.x + 14, (mapRef.current?.clientWidth ?? 400) - 260),
+                                top: Math.max(hoverInfo.y - 10, 0),
+                                pointerEvents: "none",
+                                zIndex: 50,
+                                maxWidth: 280,
+                                minWidth: 180,
+                            }}
+                            className="bg-white rounded-lg shadow-xl border border-gray-200 px-3 py-2.5 text-xs"
+                        >
+                            <div className="font-semibold text-gray-800 mb-1.5 text-[11px] uppercase tracking-wide border-b border-gray-100 pb-1">
+                                {hoverInfo.layerTitle}
+                            </div>
+                            <table className="w-full">
+                                <tbody>
+                                    {hoverInfo.fields.map((f, i) => (
+                                        <tr key={i}>
+                                            <td className="text-gray-500 pr-2 py-0.5 whitespace-nowrap align-top font-medium">
+                                                {f.label}
+                                            </td>
+                                            <td className="text-gray-900 py-0.5 break-words">
+                                                {f.value}
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+                </div>
             )}
         </div>
     );
