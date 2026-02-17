@@ -26,6 +26,7 @@ import MapView from "@arcgis/core/views/MapView";
 import Portal from "@arcgis/core/portal/Portal";
 import FeatureLayer from "@arcgis/core/layers/FeatureLayer";
 import FeatureFilter from "@arcgis/core/layers/support/FeatureFilter";
+import Color from "@arcgis/core/Color";
 import type Layer from "@arcgis/core/layers/Layer";
 import type GroupLayer from "@arcgis/core/layers/GroupLayer";
 
@@ -72,6 +73,9 @@ export function ArcGISMap({
     const mapRef = useRef<HTMLDivElement>(null);
     const viewRef = useRef<MapView | null>(null);
     const webmapRef = useRef<WebMap | null>(null);
+    const initialExtentRef = useRef<__esri.Extent | null>(null);
+    const highlightHandlesRef = useRef<__esri.Handle[]>([]);
+    const hoverHighlightRef = useRef<__esri.Handle | null>(null);
     const [status, setStatus] = useState<
         "loading" | "authenticating" | "ready" | "error"
     >("loading");
@@ -145,7 +149,7 @@ export function ArcGISMap({
         [],
     );
 
-    // ── Power BI → ArcGIS: apply filters using client-side FeatureFilter
+    // ── Power BI → ArcGIS: apply filters, zoom, and highlight ──────────
     useEffect(() => {
         const view = viewRef.current;
         const webmap = webmapRef.current;
@@ -155,8 +159,14 @@ export function ArcGISMap({
 
         const featureLayers = collectFeatureLayers(webmap.layers);
 
+        // Clear previous highlights
+        if (highlightHandlesRef.current.length > 0) {
+            for (const h of highlightHandlesRef.current) h.remove();
+            highlightHandlesRef.current = [];
+        }
+
         if (pbiFilters.length === 0) {
-            // Clear all client-side filters
+            // Clear all client-side filters and reset view
             for (const fl of featureLayers) {
                 view.whenLayerView(fl)
                     .then((layerView) => {
@@ -166,20 +176,74 @@ export function ArcGISMap({
                     .catch(() => {});
             }
             setActiveFilterLabel(null);
+            // Zoom back to full extent
+            if (initialExtentRef.current) {
+                view.goTo(initialExtentRef.current, { duration: 600 }).catch(() => {});
+            }
             return;
         }
 
-        // Apply client-side filters to each FeatureLayer
+        // Apply client-side filters + query for zoom + highlight
+        let didZoom = false;
+
         for (const fl of featureLayers) {
             const where = buildWhereClause(fl, pbiFilters);
+
             view.whenLayerView(fl)
-                .then((layerView) => {
+                .then(async (layerView) => {
                     const flv = layerView as __esri.FeatureLayerView;
                     if (where) {
                         flv.filter = new FeatureFilter({ where });
                         console.log(
                             `[ArcGIS] Client-side filter on "${fl.title}": ${where}`,
                         );
+
+                        // Zoom to filtered features (use the first polygon/boundary layer for best extent)
+                        if (!didZoom) {
+                            try {
+                                const query = fl.createQuery();
+                                query.where = where;
+                                query.returnGeometry = true;
+                                query.outFields = ["*"];
+                                const result = await fl.queryFeatures(query);
+
+                                if (result.features.length > 0) {
+                                    // Zoom to the extent of matching features
+                                    let combinedExtent: __esri.Extent | null = null;
+                                    for (const feat of result.features) {
+                                        const geom = feat.geometry;
+                                        if (!geom) continue;
+                                        const ext = "extent" in geom && geom.extent
+                                            ? geom.extent
+                                            : null;
+                                        if (ext) {
+                                            combinedExtent = combinedExtent
+                                                ? combinedExtent.union(ext)
+                                                : ext;
+                                        }
+                                    }
+
+                                    if (combinedExtent) {
+                                        await view.goTo(
+                                            combinedExtent.expand(1.3),
+                                            { duration: 800 },
+                                        );
+                                        didZoom = true;
+                                    }
+
+                                    // Highlight matching features
+                                    const handle = flv.highlight(
+                                        result.features,
+                                    );
+                                    highlightHandlesRef.current.push(handle);
+                                }
+                            } catch (err) {
+                                console.debug(
+                                    `[ArcGIS] Zoom/highlight failed for "${fl.title}":`,
+                                    err,
+                                );
+                            }
+                        }
                     } else {
                         flv.filter = null as unknown as FeatureFilter;
                     }
@@ -192,7 +256,7 @@ export function ArcGISMap({
                 });
         }
 
-        // Build a clean label using the first mapping's transform (to strip emoji)
+        // Build a clean label
         const label = pbiFilters
             .map((f) => {
                 const mapping = FIELD_MAPPINGS.find(
@@ -213,9 +277,87 @@ export function ArcGISMap({
         console.log("[ArcGIS] Applied Power BI filters (client-side) →", pbiFilters);
     }, [activeFilters, status, buildWhereClause]);
 
-    // ── ArcGIS → Power BI: map click handler ──────────────────────────
-    const handleMapClick = useCallback(
+    // ── Setup popups, hover tooltips + highlight, click → filter sync ──
+    const setupInteractions = useCallback(
         (view: MapView) => {
+            const popup = view.popup;
+            const container = view.container;
+            if (!popup || !container) return;
+
+            // 1. Enable popups (WebMap already defines popupInfo per layer)
+            view.popupEnabled = true;
+            popup.dockEnabled = true;
+            popup.dockOptions = {
+                buttonEnabled: true,
+                breakpoint: false,
+                position: "top-right",
+            };
+
+            // Track whether the popup was opened by a click (so hover doesn't close it)
+            let popupOpenedByClick = false;
+
+            // 2. Hover: show tooltip popup + highlight hovered feature
+            let hoverTimeout: ReturnType<typeof setTimeout> | null = null;
+
+            view.on("pointer-move", (event) => {
+                if (hoverTimeout) clearTimeout(hoverTimeout);
+                hoverTimeout = setTimeout(async () => {
+                    const response = await view.hitTest(event);
+                    const results = response.results.filter(
+                        (r): r is __esri.GraphicHit => r.type === "graphic",
+                    );
+
+                    // Remove previous hover highlight
+                    if (hoverHighlightRef.current) {
+                        hoverHighlightRef.current.remove();
+                        hoverHighlightRef.current = null;
+                    }
+
+                    if (results.length > 0) {
+                        const graphic = results[0].graphic;
+                        const layer = graphic.layer;
+
+                        // Change cursor to pointer
+                        container.style.cursor = "pointer";
+
+                        // Highlight the hovered feature
+                        if (layer && layer.type === "feature") {
+                            try {
+                                const layerView = await view.whenLayerView(layer);
+                                const flv = layerView as __esri.FeatureLayerView;
+                                hoverHighlightRef.current = flv.highlight(graphic);
+                            } catch {
+                                // Layer may not support highlight
+                            }
+                        }
+
+                        // Show hover popup only if no click-popup is active
+                        if (!popupOpenedByClick) {
+                            popup.open({
+                                features: [graphic],
+                                location: view.toMap(event),
+                            });
+                        }
+                    } else {
+                        // Reset cursor
+                        container.style.cursor = "default";
+
+                        // Close hover popup only if it wasn't opened by a click
+                        if (!popupOpenedByClick && popup.visible) {
+                            popup.close();
+                        }
+                    }
+                }, 100);
+            });
+
+            // Reset popupOpenedByClick when popup is closed by user
+            popup.watch("visible", (visible: boolean) => {
+                if (!visible) {
+                    popupOpenedByClick = false;
+                }
+            });
+
+            // 3. Click: show popup (sticky) + push filters to Power BI
             view.on("click", async (event) => {
                 const response = await view.hitTest(event);
                 const results = response.results.filter(
@@ -223,10 +365,20 @@ export function ArcGISMap({
                 );
 
                 if (results.length === 0) {
+                    popupOpenedByClick = false;
+                    popup.close();
                     clearFilters();
                     return;
                 }
 
+                // Open popup with all hit features (user can browse with arrows)
+                popupOpenedByClick = true;
+                popup.open({
+                    features: results.map((r) => r.graphic),
+                    location: view.toMap(event),
+                });
+
+                // Build filter entries from the first hit graphic
                 const graphic = results[0].graphic;
                 const attrs = graphic.attributes;
                 if (!attrs) return;
@@ -316,6 +468,12 @@ export function ArcGISMap({
                 container: mapRef.current!,
                 map: webmap,
                 padding: { top: 0, right: 0, bottom: 0, left: 0 },
+                highlightOptions: {
+                    color: new Color([0, 255, 255, 1]),
+                    haloColor: new Color([0, 255, 255, 1]),
+                    haloOpacity: 0.9,
+                    fillOpacity: 0.25,
+                },
             });
             viewRef.current = view;
             await view.when();
@@ -335,7 +493,8 @@ export function ArcGISMap({
                 );
             }
 
-            handleMapClick(view);
+            initialExtentRef.current = view.extent.clone();
+            setupInteractions(view);
             setStatus("ready");
             console.log(
                 "[ArcGIS] Map loaded with API key (no sign-in required)",
@@ -379,6 +538,12 @@ export function ArcGISMap({
                 container: mapRef.current!,
                 map: webmap,
                 padding: { top: 0, right: 0, bottom: 0, left: 0 },
+                highlightOptions: {
+                    color: new Color([0, 255, 255, 1]),
+                    haloColor: new Color([0, 255, 255, 1]),
+                    haloOpacity: 0.9,
+                    fillOpacity: 0.25,
+                },
             });
             viewRef.current = view;
             await view.when();
@@ -397,7 +562,8 @@ export function ArcGISMap({
                 );
             }
 
-            handleMapClick(view);
+            initialExtentRef.current = view.extent.clone();
+            setupInteractions(view);
             setStatus("ready");
             console.log("[ArcGIS] Map loaded with OAuth");
         }
@@ -459,13 +625,20 @@ export function ArcGISMap({
 
         return () => {
             cancelled = true;
+            for (const h of highlightHandlesRef.current) h.remove();
+            highlightHandlesRef.current = [];
+            if (hoverHighlightRef.current) {
+                hoverHighlightRef.current.remove();
+                hoverHighlightRef.current = null;
+            }
             if (viewRef.current) {
                 viewRef.current.destroy();
                 viewRef.current = null;
             }
             webmapRef.current = null;
+            initialExtentRef.current = null;
         };
-    }, [resolvedApiKey, resolvedClientId, resolvedWebMapId, handleMapClick]);
+    }, [resolvedApiKey, resolvedClientId, resolvedWebMapId, setupInteractions]);
 
     return (
         <div className={`arcgis-map-container ${className}`}>
