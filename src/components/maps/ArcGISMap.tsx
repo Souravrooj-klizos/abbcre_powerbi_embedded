@@ -6,12 +6,18 @@
  * Auth: API Key (preferred, no sign-in) or OAuth 2.0 (fallback).
  *
  * Filter sync (Power BI → ArcGIS):
- *   Uses client-side FeatureFilter (via FeatureLayerView.filter) instead of
- *   server-side definitionExpression. This avoids "Failed to load tile" errors
- *   because we filter already-loaded features in the browser.
+ *   Boundary/overlay polygon layers → client-side FeatureFilter to hide
+ *   non-matching counties while keeping visual renderers intact.
+ *   Point data layers (heatmap, clusters) → NO filter applied; they remain
+ *   fully visible and the view zooms to the filtered area so only relevant
+ *   points are in the viewport.
  *
  * Filter sync (ArcGIS → Power BI):
  *   On map click, reads feature attributes and pushes to shared context.
+ *
+ * Tooltip:
+ *   Reads popupInfo from each WebMap layer at load time. Shows a custom
+ *   React tooltip on hover — fully dynamic, no hard-coded field lists.
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
@@ -44,43 +50,10 @@ type ArcGISMapProps = {
     height?: string;
 };
 
-/**
- * Per-layer configuration for which fields to display in the hover tooltip.
- * Key = layer title (from WebMap). Value = array of { field, label } pairs.
- * If a layer is not listed here, the tooltip will show the first 6 non-OID fields.
- */
-const TOOLTIP_FIELDS: Record<string, { field: string; label: string }[]> = {
-    "NC_Permits_Cleaned": [
-        { field: "Permit_Number", label: "Permit #" },
-        { field: "Category", label: "Category" },
-        { field: "Type", label: "Type" },
-        { field: "Status", label: "Status" },
-        { field: "County", label: "County" },
-        { field: "Full_Address", label: "Address" },
-        { field: "Unit_Count", label: "Units" },
-    ],
-    "NC_Dentists_All merged": [
-        { field: "Dentist_Org_Name", label: "Name" },
-        { field: "Speciality", label: "Speciality" },
-        { field: "Type", label: "Type" },
-        { field: "Phone", label: "Phone" },
-        { field: "Address", label: "Address" },
-        { field: "Lebel", label: "County" },
-        { field: "Website", label: "Website" },
-    ],
-    "New overlay county": [
-        { field: "County", label: "County" },
-        { field: "Historic_Growth_Category", label: "Growth Category" },
-        { field: "Historic_5_Year_Growth___", label: "5-Year Growth (%)" },
-        { field: "Projected_Growth_Category", label: "Projected Growth" },
-        { field: "Projected_5_year_growth__census_driven____", label: "Proj. 5yr (%)" },
-        { field: "Rec_Survey", label: "Survey Available" },
-    ],
-    "North Carolina State and County Boundary Polygons": [
-        { field: "CountyName", label: "County" },
-        { field: "County", label: "County" },
-        { field: "FIPS", label: "FIPS Code" },
-    ],
+/** Tooltip field config extracted from a layer's popupInfo at load time. */
+type LayerPopupConfig = {
+    title: string;
+    fields: { field: string; label: string }[];
 };
 
 /**
@@ -102,6 +75,58 @@ function collectFeatureLayers(layers: __esri.Collection<Layer>): FeatureLayer[] 
     return result;
 }
 
+/**
+ * Detect whether a FeatureLayer uses a heatmap or cluster renderer.
+ * These layers should NOT be filtered (FeatureFilter breaks heatmap/cluster display).
+ */
+function isVisualizationLayer(fl: FeatureLayer): boolean {
+    const renderer = fl.renderer;
+    if (renderer && "type" in renderer) {
+        if (renderer.type === "heatmap") return true;
+    }
+    // Check for cluster (featureReduction)
+    if (fl.featureReduction) return true;
+    return false;
+}
+
+/**
+ * Extract popup field configuration from a loaded FeatureLayer.
+ * Reads the layer's popupTemplate/popupInfo to get field names and labels.
+ */
+function extractPopupConfig(fl: FeatureLayer): LayerPopupConfig {
+    const title = fl.title ?? "Feature";
+    const fields: { field: string; label: string }[] = [];
+
+    // Try popupTemplate.fieldInfos (set by WebMap popupInfo)
+    const template = fl.popupTemplate;
+    if (template && template.fieldInfos) {
+        for (const fi of template.fieldInfos) {
+            if (fi.visible !== false && fi.fieldName) {
+                // Skip OID/shape fields
+                const name = fi.fieldName.toLowerCase();
+                if (name === "objectid" || name === "oid" || name.startsWith("shape")) continue;
+                fields.push({
+                    field: fi.fieldName,
+                    label: fi.label || fi.fieldName,
+                });
+            }
+        }
+    }
+
+    // If no popup config, fall back to the layer's field definitions
+    if (fields.length === 0 && fl.fields) {
+        for (const f of fl.fields) {
+            const name = f.name.toLowerCase();
+            if (name === "objectid" || name === "oid" || name.startsWith("shape")) continue;
+            fields.push({ field: f.name, label: f.alias || f.name });
+        }
+        // Limit fallback to 8 fields
+        fields.splice(8);
+    }
+
+    return { title, fields };
+}
+
 export function ArcGISMap({
     webMapId,
     clientId,
@@ -116,6 +141,10 @@ export function ArcGISMap({
     const highlightHandlesRef = useRef<__esri.Handle[]>([]);
     const hoverHighlightRef = useRef<__esri.Handle | null>(null);
     const tooltipRef = useRef<HTMLDivElement>(null);
+    /** popup field configs keyed by layer title, built at load time */
+    const popupConfigsRef = useRef<Record<string, LayerPopupConfig>>({});
+    /** Set of operational layer IDs (to skip base map hits in tooltip) */
+    const operationalLayerIdsRef = useRef<Set<string>>(new Set());
     const [status, setStatus] = useState<
         "loading" | "authenticating" | "ready" | "error"
     >("loading");
@@ -196,24 +225,27 @@ export function ArcGISMap({
     );
 
     // ── Power BI → ArcGIS: apply filters, zoom, and highlight ──────────
+    // Strategy:
+    //   • Boundary / overlay polygon layers → apply FeatureFilter + highlight
+    //   • Point visualization layers (heatmap, clusters) → do NOT filter
+    //     (FeatureFilter hides the heatmap/cluster visuals). They stay fully
+    //     visible; the zoom ensures only relevant data is in the viewport.
     useEffect(() => {
         const view = viewRef.current;
         const webmap = webmapRef.current;
         if (!view || !webmap || status !== "ready") return;
 
         const pbiFilters = activeFilters.filter((f) => f.source === "powerbi");
-
         const featureLayers = collectFeatureLayers(webmap.layers);
 
         // Clear previous highlights
-        if (highlightHandlesRef.current.length > 0) {
-            for (const h of highlightHandlesRef.current) h.remove();
-            highlightHandlesRef.current = [];
-        }
+        for (const h of highlightHandlesRef.current) h.remove();
+        highlightHandlesRef.current = [];
 
         if (pbiFilters.length === 0) {
-            // Clear all client-side filters and reset view
+            // Clear filters on boundary layers and reset view
             for (const fl of featureLayers) {
+                if (isVisualizationLayer(fl)) continue; // never touched, skip
                 view.whenLayerView(fl)
                     .then((layerView) => {
                         const flv = layerView as __esri.FeatureLayerView;
@@ -222,74 +254,94 @@ export function ArcGISMap({
                     .catch(() => {});
             }
             setActiveFilterLabel(null);
-            // Zoom back to full extent
             if (initialExtentRef.current) {
                 view.goTo(initialExtentRef.current, { duration: 600 }).catch(() => {});
             }
             return;
         }
 
-        // Apply client-side filters + query for zoom + highlight
-        let didZoom = false;
+        // Separate layers into two groups
+        const filterableLayers: FeatureLayer[] = []; // polygons / overlays
+        const vizLayers: FeatureLayer[] = [];        // heatmaps / clusters
 
         for (const fl of featureLayers) {
-            const where = buildWhereClause(fl, pbiFilters);
+            if (isVisualizationLayer(fl)) {
+                vizLayers.push(fl);
+            } else {
+                filterableLayers.push(fl);
+            }
+        }
 
+        // Phase 1: Find the best polygon layer for zoom extent
+        //   Query the first filterable layer that has matching features to get
+        //   the county boundary extent, then zoom to it.
+        async function zoomToFilteredArea() {
+            const v = viewRef.current;
+            if (!v) return;
+            for (const fl of filterableLayers) {
+                const where = buildWhereClause(fl, pbiFilters);
+                if (!where) continue;
+
+                try {
+                    const query = fl.createQuery();
+                    query.where = where;
+                    query.returnGeometry = true;
+                    query.outFields = ["*"];
+                    const result = await fl.queryFeatures(query);
+
+                    if (result.features.length > 0) {
+                        let combinedExtent: __esri.Extent | null = null;
+                        for (const feat of result.features) {
+                            const geom = feat.geometry;
+                            if (!geom) continue;
+                            const ext =
+                                "extent" in geom && geom.extent
+                                    ? geom.extent
+                                    : null;
+                            if (ext) {
+                                combinedExtent = combinedExtent
+                                    ? combinedExtent.union(ext)
+                                    : ext;
+                            }
+                        }
+                        if (combinedExtent) {
+                            await v
+                                .goTo(combinedExtent.expand(1.3), { duration: 800 })
+                                .catch(() => {});
+                        }
+
+                        // Highlight the boundary features
+                        try {
+                            const lv = await v.whenLayerView(fl);
+                            const flv = lv as __esri.FeatureLayerView;
+                            const handle = flv.highlight(result.features);
+                            highlightHandlesRef.current.push(handle);
+                        } catch {
+                            // highlight not supported on this layer
+                        }
+
+                        return; // Zoomed successfully — stop
+                    }
+                } catch (err) {
+                    console.debug(
+                        `[ArcGIS] Zoom query failed for "${fl.title}":`,
+                        err,
+                    );
+                }
+            }
+        }
+
+        // Phase 2: Apply FeatureFilter to filterable (polygon) layers
+        for (const fl of filterableLayers) {
+            const where = buildWhereClause(fl, pbiFilters);
             view.whenLayerView(fl)
-                .then(async (layerView) => {
+                .then((layerView) => {
                     const flv = layerView as __esri.FeatureLayerView;
                     if (where) {
                         flv.filter = new FeatureFilter({ where });
                         console.log(
-                            `[ArcGIS] Client-side filter on "${fl.title}": ${where}`,
+                            `[ArcGIS] Filter on "${fl.title}": ${where}`,
                         );
-
-                        // Zoom to filtered features (use the first polygon/boundary layer for best extent)
-                        if (!didZoom) {
-                            try {
-                                const query = fl.createQuery();
-                                query.where = where;
-                                query.returnGeometry = true;
-                                query.outFields = ["*"];
-                                const result = await fl.queryFeatures(query);
-
-                                if (result.features.length > 0) {
-                                    // Zoom to the extent of matching features
-                                    let combinedExtent: __esri.Extent | null = null;
-                                    for (const feat of result.features) {
-                                        const geom = feat.geometry;
-                                        if (!geom) continue;
-                                        const ext = "extent" in geom && geom.extent
-                                            ? geom.extent
-                                            : null;
-                                        if (ext) {
-                                            combinedExtent = combinedExtent
-                                                ? combinedExtent.union(ext)
-                                                : ext;
-                                        }
-                                    }
-
-                                    if (combinedExtent) {
-                                        await view.goTo(
-                                            combinedExtent.expand(1.3),
-                                            { duration: 800 },
-                                        );
-                                        didZoom = true;
-                                    }
-
-                                    // Highlight matching features
-                                    const handle = flv.highlight(
-                                        result.features,
-                                    );
-                                    highlightHandlesRef.current.push(handle);
-                                }
-                            } catch (err) {
-                                console.debug(
-                                    `[ArcGIS] Zoom/highlight failed for "${fl.title}":`,
-                                    err,
-                                );
-                            }
-                        }
                     } else {
                         flv.filter = null as unknown as FeatureFilter;
                     }
@@ -301,6 +353,16 @@ export function ArcGISMap({
                     );
                 });
         }
+
+        // Do NOT filter visualization layers — log for clarity
+        for (const fl of vizLayers) {
+            console.log(
+                `[ArcGIS] Skipping filter on visualization layer "${fl.title}" (heatmap/cluster preserved)`,
+            );
+        }
+
+        // Kick off the zoom
+        zoomToFilteredArea();
 
         // Build a clean label
         const label = pbiFilters
@@ -324,6 +386,8 @@ export function ArcGISMap({
     }, [activeFilters, status, buildWhereClause]);
 
     // ── Helper: build tooltip fields from a graphic ────────────────────
+    // Uses the popupInfo extracted at load time (popupConfigsRef).
+    // Falls back to raw attributes if no popup config exists.
     const buildTooltipFields = useCallback(
         (
             graphic: __esri.Graphic,
@@ -332,26 +396,34 @@ export function ArcGISMap({
             const attrs = graphic.attributes;
             if (!attrs) return [];
 
-            const config = TOOLTIP_FIELDS[layerTitle];
-            if (config) {
-                return config
-                    .filter((c) => attrs[c.field] !== undefined && attrs[c.field] !== null)
+            const config = popupConfigsRef.current[layerTitle];
+            if (config && config.fields.length > 0) {
+                return config.fields
+                    .filter(
+                        (c) =>
+                            attrs[c.field] !== undefined &&
+                            attrs[c.field] !== null &&
+                            String(attrs[c.field]).trim() !== "",
+                    )
                     .map((c) => ({
                         label: c.label,
                         value: String(attrs[c.field]),
                     }));
             }
 
-            // Fallback: show first 6 non-OID fields
+            // Fallback: show first 8 non-OID fields
             return Object.entries(attrs)
                 .filter(
                     ([key, val]) =>
                         !key.toLowerCase().includes("objectid") &&
                         !key.toLowerCase().includes("oid") &&
+                        !key.startsWith("_") &&
+                        !key.toLowerCase().startsWith("shape") &&
                         val !== null &&
-                        val !== undefined,
+                        val !== undefined &&
+                        String(val).trim() !== "",
                 )
-                .slice(0, 6)
+                .slice(0, 8)
                 .map(([key, val]) => ({ label: key, value: String(val) }));
         },
         [],
@@ -370,8 +442,12 @@ export function ArcGISMap({
                 if (hoverTimeout) clearTimeout(hoverTimeout);
                 hoverTimeout = setTimeout(async () => {
                     const response = await view.hitTest(event);
+                    // Only consider hits from operational layers (skip base map)
                     const results = response.results.filter(
-                        (r): r is __esri.GraphicHit => r.type === "graphic",
+                        (r): r is __esri.GraphicHit =>
+                            r.type === "graphic" &&
+                            !!r.graphic.layer &&
+                            operationalLayerIdsRef.current.has(String(r.graphic.layer.id)),
                     );
 
                     // Remove previous hover highlight
@@ -442,8 +518,12 @@ export function ArcGISMap({
                 setHoverInfo(null);
 
                 const response = await view.hitTest(event);
+                // Only consider operational layer hits
                 const results = response.results.filter(
-                    (r): r is __esri.GraphicHit => r.type === "graphic",
+                    (r): r is __esri.GraphicHit =>
+                        r.type === "graphic" &&
+                        !!r.graphic.layer &&
+                        operationalLayerIdsRef.current.has(String(r.graphic.layer.id)),
                 );
 
                 if (results.length === 0) {
@@ -555,17 +635,24 @@ export function ArcGISMap({
                 return;
             }
 
-            // Log all layers found for debugging field names
+            // Build popup configs and register operational layer IDs
             const allLayers = collectFeatureLayers(webmap.layers);
+            const configs: Record<string, LayerPopupConfig> = {};
+            const layerIds = new Set<string>();
+
             for (const fl of allLayers) {
                 await fl.load();
-                const fieldNames = fl.fields.map((f) => f.name);
+                layerIds.add(String(fl.id));
+                const cfg = extractPopupConfig(fl);
+                configs[cfg.title] = cfg;
+                const isViz = isVisualizationLayer(fl);
                 console.log(
-                    `[ArcGIS] Layer "${fl.title}" fields:`,
-                    fieldNames,
+                    `[ArcGIS] Layer "${fl.title}" (${isViz ? "heatmap/cluster" : "filterable"}) — ${cfg.fields.length} popup fields`,
                 );
             }
 
+            popupConfigsRef.current = configs;
+            operationalLayerIdsRef.current = layerIds;
             initialExtentRef.current = view.extent.clone();
             setupInteractions(view);
             setStatus("ready");
@@ -626,15 +713,21 @@ export function ArcGISMap({
             }
 
             const allLayers = collectFeatureLayers(webmap.layers);
+            const configs: Record<string, LayerPopupConfig> = {};
+            const layerIds = new Set<string>();
+
             for (const fl of allLayers) {
                 await fl.load();
-                const fieldNames = fl.fields.map((f) => f.name);
+                layerIds.add(String(fl.id));
+                const cfg = extractPopupConfig(fl);
+                configs[cfg.title] = cfg;
                 console.log(
-                    `[ArcGIS] Layer "${fl.title}" fields:`,
-                    fieldNames,
+                    `[ArcGIS] Layer "${fl.title}" — ${cfg.fields.length} popup fields`,
                 );
             }
 
+            popupConfigsRef.current = configs;
+            operationalLayerIdsRef.current = layerIds;
             initialExtentRef.current = view.extent.clone();
             setupInteractions(view);
             setStatus("ready");
