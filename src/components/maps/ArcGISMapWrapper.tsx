@@ -13,7 +13,7 @@ const ArcGISMapInner = dynamic(
     {
         ssr: false,
         loading: () => (
-            <div className="w-full min-h-[500px] bg-gray-100 rounded-lg flex items-center justify-center border border-gray-200 animate-pulse">
+            <div className="w-full h-full bg-gray-100 rounded-lg flex items-center justify-center border border-gray-200 animate-pulse">
                 <p className="text-gray-500">Loading ArcGIS Map…</p>
             </div>
         ),

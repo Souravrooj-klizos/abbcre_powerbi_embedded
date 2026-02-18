@@ -22,3 +22,60 @@ body {
   font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
     "Helvetica Neue", Arial, sans-serif;
 }
+
+.custom-adjustment {
+  position: absolute;
+  right: 2.2%;
+  width: 82%;
+  bottom: 4%;
+  
+}
+
+.arcgis-map-container>div {
+  height: 600px !important;
+}
+
+@media (min-width: 991px) {
+  .arcgis-map-container>div {
+    height: 420px !important;
+  }
+  .custom-adjustment {
+    right: 3.2% !important;
+    width: 80% !important;
+    
+  }
+}
+
+@media (max-width: 768px) {
+  .arcgis-map-container>div {
+    height: 381px !important;
+  }
+  .custom-adjustment {
+    right: 5%;
+    width: 82%;
+    
+  }
+}
+
+
+@media (min-width: 1280px) {
+  .arcgis-map-container>div {
+    height: 535px !important;
+  }
+  .custom-adjustment{
+    right: 2.8%;
+    width: 81%;
+    
+  }
+}
+
+@media (min-width: 1536px) {
+  .arcgis-map-container>div {
+    height: 655px !important;
+  }
+  .custom-adjustment{
+    right: 2.2%;
+    width: 82%;
+    
+  }
+}
