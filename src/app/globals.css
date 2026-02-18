@@ -31,12 +31,13 @@ body {
   
 }
 
-.arcgis-map-container>div {
+.arcgis-map-container>div[style*="position: relative"] {
   height: 600px !important;
 }
 
+
 @media (min-width: 991px) {
-  .arcgis-map-container>div {
+  .arcgis-map-container>div[style*="position: relative"] {
     height: 420px !important;
   }
   .custom-adjustment {
@@ -47,7 +48,7 @@ body {
 }
 
 @media (max-width: 768px) {
-  .arcgis-map-container>div {
+  .arcgis-map-container>div[style*="position: relative"] {
     height: 381px !important;
   }
   .custom-adjustment {
@@ -59,7 +60,7 @@ body {
 
 
 @media (min-width: 1280px) {
-  .arcgis-map-container>div {
+  .arcgis-map-container>div[style*="position: relative"] {
     height: 535px !important;
   }
   .custom-adjustment{
@@ -70,7 +71,7 @@ body {
 }
 
 @media (min-width: 1536px) {
-  .arcgis-map-container>div {
+  .arcgis-map-container>div[style*="position: relative"] {
     height: 655px !important;
   }
   .custom-adjustment{
