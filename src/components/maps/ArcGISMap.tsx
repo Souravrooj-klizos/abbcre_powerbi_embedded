@@ -810,17 +810,18 @@ export function ArcGISMap({
         <div className={`arcgis-map-container ${className}`}>
             {/* Active filter indicator */}
             {activeFilterLabel && status === "ready" && (
-                <div className="flex items-center justify-between px-4 py-2 bg-indigo-50 border border-indigo-200 rounded-t-lg text-indigo-700 text-sm">
-                    <span>
-                        Filtered: <strong>{activeFilterLabel}</strong>
-                    </span>
-                    <button
-                        onClick={() => clearFilters()}
-                        className="text-indigo-600 hover:text-indigo-800 underline text-xs"
-                    >
-                        Clear filters
-                    </button>
-                </div>
+                // <div className="flex items-center justify-between px-4 py-2 bg-indigo-50 border border-indigo-200 rounded-t-lg text-indigo-700 text-sm">
+                //     <span>
+                //         Filtered: <strong>{activeFilterLabel}</strong>
+                //     </span>
+                //     <button
+                //         onClick={() => clearFilters()}
+                //         className="text-indigo-600 hover:text-indigo-800 underline text-xs"
+                //     >
+                //         Clear filters
+                //     </button>
+                // </div>
+                <></>
             )}
 
             {/* Status Bar: only show "sign in" / "signed in" when using OAuth */}
